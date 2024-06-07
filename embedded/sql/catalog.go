@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -260,11 +261,61 @@ func (i *Index) enginePrefix() []byte {
 	return i.table.catalog.enginePrefix
 }
 
-func (i *Index) sortableUsing(colID uint32, rangesByColID map[uint32]*typedValueRange) bool {
+func (i *Index) coversOrdCols(ordCols []*OrdCol, rangesByColID map[uint32]*typedValueRange) bool {
+	if !ordColumnsHaveSameDirection(ordCols) {
+		return false
+	}
+	return i.hasPrefix(i.cols, ordCols) || i.sortableUsing(ordCols, rangesByColID)
+}
+
+func ordColumnsHaveSameDirection(cols []*OrdCol) bool {
+	if len(cols) == 0 {
+		return true
+	}
+
+	desc := cols[0].descOrder
+	for _, ordCol := range cols[1:] {
+		if ordCol.descOrder != desc {
+			return false
+		}
+	}
+	return true
+}
+
+func (i *Index) hasPrefix(columns []*Column, ordCols []*OrdCol) bool {
+	if len(ordCols) > len(columns) {
+		return false
+	}
+
+	for j, ordCol := range ordCols {
+		aggFn, _, colName := ordCol.sel.resolve(i.table.Name())
+		if len(aggFn) > 0 {
+			return false
+		}
+
+		col, err := i.table.GetColumnByName(colName)
+		if err != nil || col.id != columns[j].id {
+			return false
+		}
+	}
+	return true
+}
+
+func (i *Index) sortableUsing(columns []*OrdCol, rangesByColID map[uint32]*typedValueRange) bool {
 	// all columns before colID must be fixedValues otherwise the index can not be used
-	for _, col := range i.cols {
-		if col.id == colID {
-			return true
+	aggFn, _, colName := columns[0].sel.resolve(i.table.Name())
+	if len(aggFn) > 0 {
+		return false
+	}
+
+	firstCol, err := i.table.GetColumnByName(colName)
+	if err != nil {
+		return false
+	}
+
+	for j, col := range i.cols {
+		if col.id == firstCol.id {
+			return i.hasPrefix(i.cols[j:], columns)
 		}
 
 		colRange, ok := rangesByColID[col.id]
@@ -359,8 +410,8 @@ func (catlg *Catalog) newTable(name string, colsSpec map[uint32]*ColSpec, maxCol
 			continue
 		}
 
-		if cs.colName == revCol {
-			return nil, fmt.Errorf("%w(%s)", ErrReservedWord, revCol)
+		if isReservedCol(cs.colName) {
+			return nil, fmt.Errorf("%w(%s)", ErrReservedWord, cs.colName)
 		}
 
 		_, colExists := table.colsByName[cs.colName]
@@ -483,8 +534,8 @@ func (t *Table) newIndex(unique bool, colIDs []uint32) (index *Index, err error)
 }
 
 func (t *Table) newColumn(spec *ColSpec) (*Column, error) {
-	if spec.colName == revCol {
-		return nil, fmt.Errorf("%w(%s)", ErrReservedWord, revCol)
+	if isReservedCol(spec.colName) {
+		return nil, fmt.Errorf("%w(%s)", ErrReservedWord, spec.colName)
 	}
 
 	if spec.autoIncrement {
@@ -547,8 +598,8 @@ func (ctlg *Catalog) renameTable(oldName, newName string) (*Table, error) {
 }
 
 func (t *Table) renameColumn(oldName, newName string) (*Column, error) {
-	if newName == revCol {
-		return nil, fmt.Errorf("%w(%s)", ErrReservedWord, revCol)
+	if isReservedCol(newName) {
+		return nil, fmt.Errorf("%w(%s)", ErrReservedWord, newName)
 	}
 
 	if oldName == newName {
@@ -956,16 +1007,17 @@ func unmapColSpec(prefix, mkey []byte) (dbID, tableID, colID uint32, colType SQL
 }
 
 func asType(t string) (SQLValueType, error) {
-	if t == IntegerType ||
-		t == Float64Type ||
-		t == BooleanType ||
-		t == VarcharType ||
-		t == UUIDType ||
-		t == BLOBType ||
-		t == TimestampType {
+	switch t {
+	case IntegerType,
+		Float64Type,
+		BooleanType,
+		VarcharType,
+		UUIDType,
+		BLOBType,
+		TimestampType,
+		JSONType:
 		return t, nil
 	}
-
 	return t, ErrCorruptedData
 }
 
@@ -1254,19 +1306,54 @@ func EncodeRawValueAsKey(val interface{}, colType SQLValueType, maxLen int) ([]b
 	return nil, 0, ErrInvalidValue
 }
 
+func getEncodeRawValue(val TypedValue, colType SQLValueType) (interface{}, error) {
+	if colType != JSONType || val.Type() == JSONType {
+		return val.RawValue(), nil
+	}
+
+	if val.Type() != VarcharType {
+		return nil, fmt.Errorf("%w: invalid json value", ErrInvalidValue)
+	}
+	s, _ := val.RawValue().(string)
+
+	raw := json.RawMessage(s)
+	if !json.Valid(raw) {
+		return nil, fmt.Errorf("%w: invalid json value", ErrInvalidValue)
+	}
+	return raw, nil
+}
+
 func EncodeValue(val TypedValue, colType SQLValueType, maxLen int) ([]byte, error) {
-	return EncodeRawValue(val.RawValue(), colType, maxLen)
+	v, err := getEncodeRawValue(val, colType)
+	if err != nil {
+		return nil, err
+	}
+	return EncodeRawValue(v, colType, maxLen, false)
+}
+
+func EncodeNullableValue(val TypedValue, colType SQLValueType, maxLen int) ([]byte, error) {
+	v, err := getEncodeRawValue(val, colType)
+	if err != nil {
+		return nil, err
+	}
+	return EncodeRawValue(v, colType, maxLen, true)
 }
 
 // EncodeRawValue encode a value in a byte format. This is the internal binary representation of a value. Can be decoded with DecodeValue.
-func EncodeRawValue(val interface{}, colType SQLValueType, maxLen int) ([]byte, error) {
+func EncodeRawValue(val interface{}, colType SQLValueType, maxLen int, nullable bool) ([]byte, error) {
 	convVal, err := mayApplyImplicitConversion(val, colType)
 	if err != nil {
 		return nil, err
 	}
 
-	if convVal == nil {
+	if convVal == nil && !nullable {
 		return nil, ErrInvalidValue
+	}
+
+	if convVal == nil {
+		encv := make([]byte, EncLenLen)
+		binary.BigEndian.PutUint32(encv[:], uint32(0))
+		return encv, nil
 	}
 
 	switch colType {
@@ -1342,6 +1429,22 @@ func EncodeRawValue(val interface{}, colType SQLValueType, maxLen int) ([]byte, 
 
 			return encv[:], nil
 		}
+	case JSONType:
+		rawJson, ok := val.(json.RawMessage)
+		if !ok {
+			data, err := json.Marshal(val)
+			if err != nil {
+				return nil, err
+			}
+			rawJson = data
+		}
+
+		// len(v) + v
+		encv := make([]byte, EncLenLen+len(rawJson))
+		binary.BigEndian.PutUint32(encv[:], uint32(len(rawJson)))
+		copy(encv[EncLenLen:], rawJson)
+
+		return encv[:], nil
 	case UUIDType:
 		{
 			uuidVal, ok := convVal.(uuid.UUID)
@@ -1405,9 +1508,21 @@ func DecodeValueLength(b []byte) (int, int, error) {
 }
 
 func DecodeValue(b []byte, colType SQLValueType) (TypedValue, int, error) {
+	return decodeValue(b, colType, false)
+}
+
+func DecodeNullableValue(b []byte, colType SQLValueType) (TypedValue, int, error) {
+	return decodeValue(b, colType, true)
+}
+
+func decodeValue(b []byte, colType SQLValueType, nullable bool) (TypedValue, int, error) {
 	vlen, voff, err := DecodeValueLength(b)
 	if err != nil {
 		return nil, 0, err
+	}
+
+	if vlen == 0 && nullable {
+		return &NullValue{t: colType}, voff, nil
 	}
 
 	switch colType {
@@ -1446,6 +1561,16 @@ func DecodeValue(b []byte, colType SQLValueType) (TypedValue, int, error) {
 			voff += vlen
 
 			return &Blob{val: v}, voff, nil
+		}
+	case JSONType:
+		{
+			v := b[voff : voff+vlen]
+			voff += vlen
+
+			var val interface{}
+			err = json.Unmarshal(v, &val)
+
+			return &JSON{val: val}, voff, err
 		}
 	case UUIDType:
 		{

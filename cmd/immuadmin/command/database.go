@@ -18,9 +18,11 @@ package immuadmin
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/codenotary/immudb/cmd/helper"
 	c "github.com/codenotary/immudb/cmd/helper"
 	"github.com/codenotary/immudb/embedded/store"
 	"github.com/codenotary/immudb/embedded/tbtree"
@@ -55,7 +57,7 @@ func addDbUpdateFlags(c *cobra.Command) {
 	c.Flags().Uint32("indexing-flush-threshold", tbtree.DefaultFlushThld, "number of new index entries between disk flushes")
 	c.Flags().Float32("indexing-cleanup-percentage", tbtree.DefaultCleanUpPercentage, "percentage of node files cleaned up during each flush")
 	c.Flags().Uint32("indexing-sync-threshold", tbtree.DefaultSyncThld, "number of new index entries between disk flushes with file sync")
-	c.Flags().Uint32("indexing-cache-size", tbtree.DefaultCacheSize, "size of the Btree node LRU cache (number of nodes)")
+	c.Flags().Uint32("indexing-cache-size", tbtree.DefaultCacheSize, "size of the Btree node cache (number of nodes)")
 	c.Flags().Uint32("indexing-max-active-snapshots", tbtree.DefaultMaxActiveSnapshots, "maximum number of active btree snapshots")
 
 	c.Flags().Uint32("write-tx-header-version", 1, "set write tx header version (use 0 for compatibility with immudb 1.1, 1 for immudb 1.2+)")
@@ -106,10 +108,10 @@ func (cl *commandline) database(cmd *cobra.Command) {
 			}
 			c.PrintTable(
 				cmd.OutOrStdout(),
-				[]string{"Database Name", "Status"},
+				[]string{"Database Name", "Created At", "Created By", "Status", "Is Replica", "Disk Size", "Transactions"},
 				len(resp.Databases),
 				func(i int) []string {
-					row := make([]string, 2)
+					row := make([]string, 7)
 
 					db := resp.Databases[i]
 
@@ -118,11 +120,20 @@ func (cl *commandline) database(cmd *cobra.Command) {
 					}
 					row[0] += db.Name
 
+					row[1] = time.Unix(int64(db.CreatedAt), 0).Format("2006-01-02")
+					row[2] = db.CreatedBy
+
 					if db.GetLoaded() {
-						row[1] += "LOADED"
+						row[3] += "LOADED"
 					} else {
-						row[1] += "UNLOADED"
+						row[3] += "UNLOADED"
 					}
+
+					isReplica := db.Settings.ReplicationSettings.Replica != nil && db.Settings.ReplicationSettings.Replica.Value
+
+					row[4] = strings.ToUpper(strconv.FormatBool(isReplica))
+					row[5] = helper.FormatByteSize(db.DiskSize)
+					row[6] = strconv.FormatUint(db.NumTransactions, 10)
 
 					return row
 				},

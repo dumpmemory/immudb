@@ -54,14 +54,13 @@ var ErrNotNullableColumnCannotBeNull = errors.New("not nullable column can not b
 var ErrNewColumnMustBeNullable = errors.New("new column must be nullable")
 var ErrIndexAlreadyExists = errors.New("index already exists")
 var ErrMaxNumberOfColumnsInIndexExceeded = errors.New("number of columns in multi-column index exceeded")
-var ErrNoAvailableIndex = errors.New("no available index")
 var ErrIndexNotFound = errors.New("index not found")
+var ErrCannotIndexJson = errors.New("cannot index column of type json")
 var ErrInvalidNumberOfValues = errors.New("invalid number of values provided")
 var ErrInvalidValue = errors.New("invalid value provided")
 var ErrInferredMultipleTypes = errors.New("inferred multiple types")
 var ErrExpectingDQLStmt = errors.New("illegal statement. DQL statement expected")
-var ErrLimitedOrderBy = errors.New("order is limit to one indexed column")
-var ErrLimitedGroupBy = errors.New("group by requires ordering by the grouping column")
+var ErrColumnMustAppearInGroupByOrAggregation = errors.New("must appear in the group by clause or be used in an aggregated function")
 var ErrIllegalMappedKey = errors.New("error illegal mapped key")
 var ErrCorruptedData = store.ErrCorruptedData
 var ErrBrokenCatalogColSpecExpirable = fmt.Errorf("%w: catalog column entry set as expirable", ErrCorruptedData)
@@ -91,6 +90,7 @@ var ErrAlreadyClosed = store.ErrAlreadyClosed
 var ErrAmbiguousSelector = errors.New("ambiguous selector")
 var ErrUnsupportedCast = fmt.Errorf("%w: unsupported cast", ErrInvalidValue)
 var ErrColumnMismatchInUnionStmt = errors.New("column mismatch in union statement")
+var ErrInvalidTxMetadata = errors.New("invalid transaction metadata")
 
 var MaxKeyLen = 512
 
@@ -104,10 +104,11 @@ type Engine struct {
 
 	prefix                        []byte
 	distinctLimit                 int
+	sortBufferSize                int
 	autocommit                    bool
 	lazyIndexConstraintValidation bool
-
-	multidbHandler MultiDBHandler
+	parseTxMetadata               func([]byte) (map[string]interface{}, error)
+	multidbHandler                MultiDBHandler
 }
 
 type MultiDBHandler interface {
@@ -144,8 +145,10 @@ func NewEngine(st *store.ImmuStore, opts *Options) (*Engine, error) {
 		store:                         st,
 		prefix:                        make([]byte, len(opts.prefix)),
 		distinctLimit:                 opts.distinctLimit,
+		sortBufferSize:                opts.sortBufferSize,
 		autocommit:                    opts.autocommit,
 		lazyIndexConstraintValidation: opts.lazyIndexConstraintValidation,
+		parseTxMetadata:               opts.parseTxMetadata,
 		multidbHandler:                opts.multidbHandler,
 	}
 
@@ -504,6 +507,16 @@ func (e *Engine) execPreparedStmts(ctx context.Context, tx *SQLTx, stmts []SQLSt
 	}
 
 	return currTx, committedTxs, stmts[execStmts:], nil
+}
+
+func (e *Engine) queryAll(ctx context.Context, tx *SQLTx, sql string, params map[string]interface{}) ([]*Row, error) {
+	reader, err := e.Query(ctx, tx, sql, params)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	return ReadAllRows(ctx, reader)
 }
 
 func (e *Engine) Query(ctx context.Context, tx *SQLTx, sql string, params map[string]interface{}) (RowReader, error) {

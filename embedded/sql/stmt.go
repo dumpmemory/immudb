@@ -20,10 +20,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,20 +39,34 @@ const (
 	catalogColumnPrefix = "CTL.COLUMN." // (key=CTL.COLUMN.{1}{tableID}{colID}{colTYPE}, value={(auto_incremental | nullable){maxLen}{colNAME}})
 	catalogIndexPrefix  = "CTL.INDEX."  // (key=CTL.INDEX.{1}{tableID}{indexID}, value={unique {colID1}(ASC|DESC)...{colIDN}(ASC|DESC)})
 
-	RowPrefix = "R." // (key=R.{1}{tableID}{0}({null}({pkVal}{padding}{pkValLen})?)+, value={count (colID valLen val)+})
-
+	RowPrefix    = "R." // (key=R.{1}{tableID}{0}({null}({pkVal}{padding}{pkValLen})?)+, value={count (colID valLen val)+})
 	MappedPrefix = "M." // (key=M.{tableID}{indexID}({null}({val}{padding}{valLen})?)*({pkVal}{padding}{pkValLen})+, value={count (colID valLen val)+})
 )
 
-const DatabaseID = uint32(1) // deprecated but left to maintain backwards compatibility
-const PKIndexID = uint32(0)
+const (
+	DatabaseID = uint32(1) // deprecated but left to maintain backwards compatibility
+	PKIndexID  = uint32(0)
+)
 
 const (
 	nullableFlag      byte = 1 << iota
 	autoIncrementFlag byte = 1 << iota
 )
 
-const revCol = "_rev"
+const (
+	revCol        = "_rev"
+	txMetadataCol = "_tx_metadata"
+)
+
+var reservedColumns = map[string]struct{}{
+	revCol:        {},
+	txMetadataCol: {},
+}
+
+func isReservedCol(col string) bool {
+	_, ok := reservedColumns[col]
+	return ok
+}
 
 type SQLValueType = string
 
@@ -63,6 +79,7 @@ const (
 	Float64Type   SQLValueType = "FLOAT"
 	TimestampType SQLValueType = "TIMESTAMP"
 	AnyType       SQLValueType = "ANY"
+	JSONType      SQLValueType = "JSON"
 )
 
 func IsNumericType(t SQLValueType) bool {
@@ -123,14 +140,15 @@ const (
 )
 
 const (
-	NowFnCall       string = "NOW"
-	UUIDFnCall      string = "RANDOM_UUID"
-	DatabasesFnCall string = "DATABASES"
-	TablesFnCall    string = "TABLES"
-	TableFnCall     string = "TABLE"
-	UsersFnCall     string = "USERS"
-	ColumnsFnCall   string = "COLUMNS"
-	IndexesFnCall   string = "INDEXES"
+	NowFnCall        string = "NOW"
+	UUIDFnCall       string = "RANDOM_UUID"
+	DatabasesFnCall  string = "DATABASES"
+	TablesFnCall     string = "TABLES"
+	TableFnCall      string = "TABLE"
+	UsersFnCall      string = "USERS"
+	ColumnsFnCall    string = "COLUMNS"
+	IndexesFnCall    string = "INDEXES"
+	JSONTypeOfFnCall string = "JSON_TYPEOF"
 )
 
 type SQLStmt interface {
@@ -457,6 +475,10 @@ func (stmt *CreateIndexStmt) execAt(ctx context.Context, tx *SQLTx, params map[s
 		col, err := table.GetColumnByName(colName)
 		if err != nil {
 			return nil, err
+		}
+
+		if col.Type() == JSONType {
+			return nil, ErrCannotIndexJson
 		}
 
 		if variableSizedType(col.colType) && !tx.engine.lazyIndexConstraintValidation && (col.MaxLen() == 0 || col.MaxLen() > MaxKeyLen) {
@@ -842,6 +864,9 @@ func (stmt *UpsertIntoStmt) execAt(ctx context.Context, tx *SQLTx, params map[st
 
 		// pk entry
 		mappedPKey := MapKey(tx.sqlPrefix(), MappedPrefix, EncodeID(table.id), EncodeID(table.primaryIndex.id), pkEncVals, pkEncVals)
+		if len(mappedPKey) > MaxKeyLen {
+			return nil, ErrMaxKeyLengthExceeded
+		}
 
 		_, err = tx.get(ctx, mappedPKey)
 		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
@@ -1548,6 +1573,23 @@ type TypedValue interface {
 	RawValue() interface{}
 	Compare(val TypedValue) (int, error)
 	IsNull() bool
+	String() string
+}
+
+type Tuple []TypedValue
+
+func (t Tuple) Compare(other Tuple) (int, int, error) {
+	if len(t) != len(other) {
+		return -1, -1, ErrNotComparableValues
+	}
+
+	for i := range t {
+		res, err := t[i].Compare(other[i])
+		if err != nil || res != 0 {
+			return res, i, err
+		}
+	}
+	return 0, -1, nil
 }
 
 func NewNull(t SQLValueType) *NullValue {
@@ -1570,6 +1612,10 @@ func (n *NullValue) IsNull() bool {
 	return true
 }
 
+func (n *NullValue) String() string {
+	return "NULL"
+}
+
 func (n *NullValue) Compare(val TypedValue) (int, error) {
 	if n.t != AnyType && val.Type() != AnyType && n.t != val.Type() {
 		return 0, ErrNotComparableValues
@@ -1578,7 +1624,6 @@ func (n *NullValue) Compare(val TypedValue) (int, error) {
 	if val.RawValue() == nil {
 		return 0, nil
 	}
-
 	return -1, nil
 }
 
@@ -1636,12 +1681,16 @@ func (v *Integer) IsNull() bool {
 	return false
 }
 
+func (v *Integer) String() string {
+	return strconv.FormatInt(v.val, 10)
+}
+
 func (v *Integer) inferType(cols map[string]ColDescriptor, params map[string]SQLValueType, implicitTable string) (SQLValueType, error) {
 	return IntegerType, nil
 }
 
 func (v *Integer) requiresType(t SQLValueType, cols map[string]ColDescriptor, params map[string]SQLValueType, implicitTable string) error {
-	if t != IntegerType {
+	if t != IntegerType && t != JSONType {
 		return fmt.Errorf("%w: %v can not be interpreted as type %v", ErrInvalidTypes, IntegerType, t)
 	}
 
@@ -1677,6 +1726,11 @@ func (v *Integer) Compare(val TypedValue) (int, error) {
 		return 1, nil
 	}
 
+	if val.Type() == JSONType {
+		res, err := val.Compare(v)
+		return -res, err
+	}
+
 	if val.Type() == Float64Type {
 		r, err := val.Compare(v)
 		return r * -1, err
@@ -1709,6 +1763,10 @@ func (v *Timestamp) Type() SQLValueType {
 
 func (v *Timestamp) IsNull() bool {
 	return false
+}
+
+func (v *Timestamp) String() string {
+	return v.val.Format("2006-01-02 15:04:05.999999")
 }
 
 func (v *Timestamp) inferType(cols map[string]ColDescriptor, params map[string]SQLValueType, implicitTable string) (SQLValueType, error) {
@@ -1785,15 +1843,18 @@ func (v *Varchar) IsNull() bool {
 	return false
 }
 
+func (v *Varchar) String() string {
+	return v.val
+}
+
 func (v *Varchar) inferType(cols map[string]ColDescriptor, params map[string]SQLValueType, implicitTable string) (SQLValueType, error) {
 	return VarcharType, nil
 }
 
 func (v *Varchar) requiresType(t SQLValueType, cols map[string]ColDescriptor, params map[string]SQLValueType, implicitTable string) error {
-	if t != VarcharType {
+	if t != VarcharType && t != JSONType {
 		return fmt.Errorf("%w: %v can not be interpreted as type %v", ErrInvalidTypes, VarcharType, t)
 	}
-
 	return nil
 }
 
@@ -1826,6 +1887,11 @@ func (v *Varchar) Compare(val TypedValue) (int, error) {
 		return 1, nil
 	}
 
+	if val.Type() == JSONType {
+		res, err := val.Compare(v)
+		return -res, err
+	}
+
 	if val.Type() != VarcharType {
 		return 0, ErrNotComparableValues
 	}
@@ -1849,6 +1915,10 @@ func (v *UUID) Type() SQLValueType {
 
 func (v *UUID) IsNull() bool {
 	return false
+}
+
+func (v *UUID) String() string {
+	return v.val.String()
 }
 
 func (v *UUID) inferType(cols map[string]ColDescriptor, params map[string]SQLValueType, implicitTable string) (SQLValueType, error) {
@@ -1917,15 +1987,18 @@ func (v *Bool) IsNull() bool {
 	return false
 }
 
+func (v *Bool) String() string {
+	return strconv.FormatBool(v.val)
+}
+
 func (v *Bool) inferType(cols map[string]ColDescriptor, params map[string]SQLValueType, implicitTable string) (SQLValueType, error) {
 	return BooleanType, nil
 }
 
 func (v *Bool) requiresType(t SQLValueType, cols map[string]ColDescriptor, params map[string]SQLValueType, implicitTable string) error {
-	if t != BooleanType {
+	if t != BooleanType && t != JSONType {
 		return fmt.Errorf("%w: %v can not be interpreted as type %v", ErrInvalidTypes, BooleanType, t)
 	}
-
 	return nil
 }
 
@@ -1956,6 +2029,11 @@ func (v *Bool) RawValue() interface{} {
 func (v *Bool) Compare(val TypedValue) (int, error) {
 	if val.IsNull() {
 		return 1, nil
+	}
+
+	if val.Type() == JSONType {
+		res, err := val.Compare(v)
+		return -res, err
 	}
 
 	if val.Type() != BooleanType {
@@ -1989,6 +2067,10 @@ func (v *Blob) Type() SQLValueType {
 
 func (v *Blob) IsNull() bool {
 	return false
+}
+
+func (v *Blob) String() string {
+	return hex.EncodeToString(v.val)
 }
 
 func (v *Blob) inferType(cols map[string]ColDescriptor, params map[string]SQLValueType, implicitTable string) (SQLValueType, error) {
@@ -2057,15 +2139,18 @@ func (v *Float64) IsNull() bool {
 	return false
 }
 
+func (v *Float64) String() string {
+	return strconv.FormatFloat(float64(v.val), 'f', -1, 64)
+}
+
 func (v *Float64) inferType(cols map[string]ColDescriptor, params map[string]SQLValueType, implicitTable string) (SQLValueType, error) {
 	return Float64Type, nil
 }
 
 func (v *Float64) requiresType(t SQLValueType, cols map[string]ColDescriptor, params map[string]SQLValueType, implicitTable string) error {
-	if t != Float64Type {
+	if t != Float64Type && t != JSONType {
 		return fmt.Errorf("%w: %v can not be interpreted as type %v", ErrInvalidTypes, Float64Type, t)
 	}
-
 	return nil
 }
 
@@ -2094,6 +2179,11 @@ func (v *Float64) RawValue() interface{} {
 }
 
 func (v *Float64) Compare(val TypedValue) (int, error) {
+	if val.Type() == JSONType {
+		res, err := val.Compare(v)
+		return -res, err
+	}
+
 	convVal, err := mayApplyImplicitConversion(val.RawValue(), Float64Type)
 	if err != nil {
 		return 0, err
@@ -2133,6 +2223,10 @@ func (v *FnCall) inferType(cols map[string]ColDescriptor, params map[string]SQLV
 		return UUIDType, nil
 	}
 
+	if strings.ToUpper(v.fn) == JSONTypeOfFnCall {
+		return VarcharType, nil
+	}
+
 	return AnyType, fmt.Errorf("%w: unknown function %s", ErrIllegalArguments, v.fn)
 }
 
@@ -2150,6 +2244,13 @@ func (v *FnCall) requiresType(t SQLValueType, cols map[string]ColDescriptor, par
 			return fmt.Errorf("%w: %v can not be interpreted as type %v", ErrInvalidTypes, UUIDType, t)
 		}
 
+		return nil
+	}
+
+	if strings.ToUpper(v.fn) == JSONTypeOfFnCall {
+		if t != VarcharType {
+			return fmt.Errorf("%w: %v can not be interpreted as type %v", ErrInvalidTypes, VarcharType, t)
+		}
 		return nil
 	}
 
@@ -2187,6 +2288,26 @@ func (v *FnCall) reduce(tx *SQLTx, row *Row, implicitTable string) (TypedValue, 
 		return &UUID{val: uuid.New()}, nil
 	}
 
+	if strings.ToUpper(v.fn) == JSONTypeOfFnCall {
+		if len(v.params) != 1 {
+			return nil, fmt.Errorf("%w: '%s' function expects %d arguments but %d were provided", ErrIllegalArguments, JSONTypeOfFnCall, 1, len(v.params))
+		}
+
+		v, err := v.params[0].reduce(tx, row, implicitTable)
+		if err != nil {
+			return nil, err
+		}
+
+		if v.IsNull() {
+			return NewNull(AnyType), nil
+		}
+
+		jsonVal, ok := v.(*JSON)
+		if !ok {
+			return nil, fmt.Errorf("%w: '%s' function expects an argument of type JSON", ErrIllegalArguments, JSONTypeOfFnCall)
+		}
+		return NewVarchar(jsonVal.primitiveType()), nil
+	}
 	return nil, fmt.Errorf("%w: unkown function %s", ErrIllegalArguments, v.fn)
 }
 
@@ -2338,7 +2459,6 @@ func (p *Param) substitute(params map[string]interface{}) (ValueExp, error) {
 			return &Float64{val: v}, nil
 		}
 	}
-
 	return nil, ErrUnsupportedParameter
 }
 
@@ -2428,38 +2548,47 @@ func (stmt *SelectStmt) execAt(ctx context.Context, tx *SQLTx, params map[string
 		return nil, ErrHavingClauseRequiresGroupClause
 	}
 
-	if len(stmt.groupBy) > 1 {
-		return nil, ErrLimitedGroupBy
-	}
-
-	if len(stmt.orderBy) > 1 {
-		return nil, ErrLimitedOrderBy
+	if stmt.containsAggregations() || len(stmt.groupBy) > 0 {
+		for _, sel := range stmt.selectors {
+			_, isAgg := sel.(*AggColSelector)
+			if !isAgg && !stmt.groupByContains(sel) {
+				return nil, fmt.Errorf("%s: %w", EncodeSelector(sel.resolve(stmt.Alias())), ErrColumnMustAppearInGroupByOrAggregation)
+			}
+		}
 	}
 
 	if len(stmt.orderBy) > 0 {
-		tableRef, ok := stmt.ds.(*tableRef)
-		if !ok {
-			return nil, ErrLimitedOrderBy
-		}
-
-		table, err := tableRef.referencedTable(tx)
-		if err != nil {
-			return nil, err
-		}
-
-		colName := stmt.orderBy[0].sel.col
-
-		indexed, err := table.IsIndexed(colName)
-		if err != nil {
-			return nil, err
-		}
-
-		if !indexed {
-			return nil, ErrLimitedOrderBy
+		for _, col := range stmt.orderBy {
+			sel := col.sel
+			_, isAgg := sel.(*AggColSelector)
+			if (isAgg && !stmt.containsSelector(sel)) || (!isAgg && len(stmt.groupBy) > 0 && !stmt.groupByContains(sel)) {
+				return nil, fmt.Errorf("%s: %w", EncodeSelector(sel.resolve(stmt.Alias())), ErrColumnMustAppearInGroupByOrAggregation)
+			}
 		}
 	}
-
 	return tx, nil
+}
+
+func (stmt *SelectStmt) containsSelector(s Selector) bool {
+	encSel := EncodeSelector(s.resolve(stmt.Alias()))
+
+	for _, sel := range stmt.selectors {
+		if EncodeSelector(sel.resolve(stmt.Alias())) == encSel {
+			return true
+		}
+	}
+	return false
+}
+
+func (stmt *SelectStmt) groupByContains(sel Selector) bool {
+	encSel := EncodeSelector(sel.resolve(stmt.Alias()))
+
+	for _, colSel := range stmt.groupBy {
+		if EncodeSelector(colSel.resolve(stmt.Alias())) == encSel {
+			return true
+		}
+	}
+	return false
 }
 
 func (stmt *SelectStmt) Resolve(ctx context.Context, tx *SQLTx, params map[string]interface{}, _ *ScanSpecs) (ret RowReader, err error) {
@@ -2479,7 +2608,8 @@ func (stmt *SelectStmt) Resolve(ctx context.Context, tx *SQLTx, params map[strin
 	}()
 
 	if stmt.joins != nil {
-		jointRowReader, err := newJointRowReader(rowReader, stmt.joins)
+		var jointRowReader *jointRowReader
+		jointRowReader, err = newJointRowReader(rowReader, stmt.joins)
 		if err != nil {
 			return nil, err
 		}
@@ -2490,21 +2620,18 @@ func (stmt *SelectStmt) Resolve(ctx context.Context, tx *SQLTx, params map[strin
 		rowReader = newConditionalRowReader(rowReader, stmt.where)
 	}
 
-	containsAggregations := false
-	for _, sel := range stmt.selectors {
-		_, containsAggregations = sel.(*AggColSelector)
-		if containsAggregations {
-			break
-		}
-	}
-
-	if containsAggregations {
-		var groupBy []*ColSelector
-		if stmt.groupBy != nil {
-			groupBy = stmt.groupBy
+	if stmt.containsAggregations() || len(stmt.groupBy) > 0 {
+		if len(scanSpecs.groupBySortColumns) > 0 {
+			var sortRowReader *sortRowReader
+			sortRowReader, err = newSortRowReader(rowReader, scanSpecs.groupBySortColumns)
+			if err != nil {
+				return nil, err
+			}
+			rowReader = sortRowReader
 		}
 
-		groupedRowReader, err := newGroupedRowReader(rowReader, stmt.selectors, groupBy)
+		var groupedRowReader *groupedRowReader
+		groupedRowReader, err = newGroupedRowReader(rowReader, stmt.selectors, stmt.groupBy)
 		if err != nil {
 			return nil, err
 		}
@@ -2515,6 +2642,15 @@ func (stmt *SelectStmt) Resolve(ctx context.Context, tx *SQLTx, params map[strin
 		}
 	}
 
+	if len(scanSpecs.orderBySortCols) > 0 {
+		var sortRowReader *sortRowReader
+		sortRowReader, err = newSortRowReader(rowReader, stmt.orderBy)
+		if err != nil {
+			return nil, err
+		}
+		rowReader = sortRowReader
+	}
+
 	projectedRowReader, err := newProjectedRowReader(ctx, rowReader, stmt.as, stmt.selectors)
 	if err != nil {
 		return nil, err
@@ -2522,7 +2658,8 @@ func (stmt *SelectStmt) Resolve(ctx context.Context, tx *SQLTx, params map[strin
 	rowReader = projectedRowReader
 
 	if stmt.distinct {
-		distinctRowReader, err := newDistinctRowReader(ctx, rowReader)
+		var distinctRowReader *distinctRowReader
+		distinctRowReader, err = newDistinctRowReader(ctx, rowReader)
 		if err != nil {
 			return nil, err
 		}
@@ -2530,7 +2667,8 @@ func (stmt *SelectStmt) Resolve(ctx context.Context, tx *SQLTx, params map[strin
 	}
 
 	if stmt.offset != nil {
-		offset, err := evalExpAsInt(tx, stmt.offset, params)
+		var offset int
+		offset, err = evalExpAsInt(tx, stmt.offset, params)
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid offset", err)
 		}
@@ -2539,7 +2677,8 @@ func (stmt *SelectStmt) Resolve(ctx context.Context, tx *SQLTx, params map[strin
 	}
 
 	if stmt.limit != nil {
-		limit, err := evalExpAsInt(tx, stmt.limit, params)
+		var limit int
+		limit, err = evalExpAsInt(tx, stmt.limit, params)
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid limit", err)
 		}
@@ -2554,6 +2693,64 @@ func (stmt *SelectStmt) Resolve(ctx context.Context, tx *SQLTx, params map[strin
 	}
 
 	return rowReader, nil
+}
+
+func (stmt *SelectStmt) rearrangeOrdColumns(groupByCols, orderByCols []*OrdCol) ([]*OrdCol, []*OrdCol) {
+	if len(groupByCols) > 0 && len(orderByCols) > 0 && !ordColumnsHaveAggregations(orderByCols) {
+		if ordColsHasPrefix(orderByCols, groupByCols, stmt.Alias()) {
+			return orderByCols, nil
+		}
+
+		if ordColsHasPrefix(groupByCols, orderByCols, stmt.Alias()) {
+			for i := range orderByCols {
+				groupByCols[i].descOrder = orderByCols[i].descOrder
+			}
+			return groupByCols, nil
+		}
+	}
+	return groupByCols, orderByCols
+}
+
+func ordColsHasPrefix(cols, prefix []*OrdCol, table string) bool {
+	if len(prefix) > len(cols) {
+		return false
+	}
+
+	for i := range prefix {
+		if EncodeSelector(prefix[i].sel.resolve(table)) != EncodeSelector(cols[i].sel.resolve(table)) {
+			return false
+		}
+	}
+	return true
+}
+
+func (stmt *SelectStmt) groupByOrdColumns() []*OrdCol {
+	groupByCols := stmt.groupBy
+
+	ordCols := make([]*OrdCol, 0, len(groupByCols))
+	for _, col := range groupByCols {
+		ordCols = append(ordCols, &OrdCol{sel: col})
+	}
+	return ordCols
+}
+
+func ordColumnsHaveAggregations(cols []*OrdCol) bool {
+	for _, ordCol := range cols {
+		if _, isAgg := ordCol.sel.(*AggColSelector); isAgg {
+			return true
+		}
+	}
+	return false
+}
+
+func (stmt *SelectStmt) containsAggregations() bool {
+	for _, sel := range stmt.selectors {
+		_, isAgg := sel.(*AggColSelector)
+		if isAgg {
+			return true
+		}
+	}
+	return false
 }
 
 func evalExpAsInt(tx *SQLTx, exp ValueExp, params map[string]interface{}) (int, error) {
@@ -2592,10 +2789,33 @@ func (stmt *SelectStmt) Alias() string {
 	return stmt.as
 }
 
+func (stmt *SelectStmt) hasTxMetadata() bool {
+	for _, sel := range stmt.selectors {
+		switch s := sel.(type) {
+		case *ColSelector:
+			if s.col == txMetadataCol {
+				return true
+			}
+		case *JSONSelector:
+			if s.ColSelector.col == txMetadataCol {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (stmt *SelectStmt) genScanSpecs(tx *SQLTx, params map[string]interface{}) (*ScanSpecs, error) {
+	groupByCols, orderByCols := stmt.groupByOrdColumns(), stmt.orderBy
+
 	tableRef, isTableRef := stmt.ds.(*tableRef)
 	if !isTableRef {
-		return nil, nil
+		groupByCols, orderByCols = stmt.rearrangeOrdColumns(groupByCols, orderByCols)
+
+		return &ScanSpecs{
+			groupBySortColumns: groupByCols,
+			orderBySortCols:    orderByCols,
+		}, nil
 	}
 
 	table, err := tableRef.referencedTable(tx)
@@ -2611,71 +2831,82 @@ func (stmt *SelectStmt) genScanSpecs(tx *SQLTx, params map[string]interface{}) (
 		}
 	}
 
-	var preferredIndex *Index
-
-	if len(stmt.indexOn) > 0 {
-		cols := make([]*Column, len(stmt.indexOn))
-
-		for i, colName := range stmt.indexOn {
-			col, err := table.GetColumnByName(colName)
-			if err != nil {
-				return nil, err
-			}
-
-			cols[i] = col
-		}
-
-		index, err := table.GetIndexByName(indexName(table.name, cols))
-		if err != nil {
-			return nil, err
-		}
-
-		preferredIndex = index
+	preferredIndex, err := stmt.getPreferredIndex(table)
+	if err != nil {
+		return nil, err
 	}
 
 	var sortingIndex *Index
-	var descOrder bool
-
-	if stmt.orderBy == nil {
-		if preferredIndex == nil {
-			sortingIndex = table.primaryIndex
-		} else {
-			sortingIndex = preferredIndex
-		}
-	}
-
-	if len(stmt.orderBy) > 0 {
-		col, err := table.GetColumnByName(stmt.orderBy[0].sel.col)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, idx := range table.indexesByColID[col.id] {
-			if idx.sortableUsing(col.id, rangesByColID) {
-				if preferredIndex == nil || idx.id == preferredIndex.id {
-					sortingIndex = idx
-					break
-				}
-			}
-		}
-
-		descOrder = stmt.orderBy[0].descOrder
+	if preferredIndex == nil {
+		sortingIndex = stmt.selectSortingIndex(groupByCols, orderByCols, table, rangesByColID)
+	} else {
+		sortingIndex = preferredIndex
 	}
 
 	if sortingIndex == nil {
-		return nil, ErrNoAvailableIndex
+		sortingIndex = table.primaryIndex
 	}
 
 	if tableRef.history && !sortingIndex.IsPrimary() {
 		return nil, fmt.Errorf("%w: historical queries are supported over primary index", ErrIllegalArguments)
 	}
 
+	var descOrder bool
+	if len(groupByCols) > 0 && sortingIndex.coversOrdCols(groupByCols, rangesByColID) {
+		groupByCols = nil
+	}
+
+	if len(groupByCols) == 0 && len(orderByCols) > 0 && sortingIndex.coversOrdCols(orderByCols, rangesByColID) {
+		descOrder = orderByCols[0].descOrder
+		orderByCols = nil
+	}
+
+	groupByCols, orderByCols = stmt.rearrangeOrdColumns(groupByCols, orderByCols)
+
 	return &ScanSpecs{
-		Index:          sortingIndex,
-		rangesByColID:  rangesByColID,
-		IncludeHistory: tableRef.history,
-		DescOrder:      descOrder,
+		Index:              sortingIndex,
+		rangesByColID:      rangesByColID,
+		IncludeHistory:     tableRef.history,
+		IncludeTxMetadata:  stmt.hasTxMetadata(),
+		DescOrder:          descOrder,
+		groupBySortColumns: groupByCols,
+		orderBySortCols:    orderByCols,
 	}, nil
+}
+
+func (stmt *SelectStmt) selectSortingIndex(groupByCols, orderByCols []*OrdCol, table *Table, rangesByColId map[uint32]*typedValueRange) *Index {
+	sortCols := groupByCols
+	if len(sortCols) == 0 {
+		sortCols = orderByCols
+	}
+
+	if len(sortCols) == 0 {
+		return nil
+	}
+
+	for _, idx := range table.indexes {
+		if idx.coversOrdCols(sortCols, rangesByColId) {
+			return idx
+		}
+	}
+	return nil
+}
+
+func (stmt *SelectStmt) getPreferredIndex(table *Table) (*Index, error) {
+	if len(stmt.indexOn) == 0 {
+		return nil, nil
+	}
+
+	cols := make([]*Column, len(stmt.indexOn))
+	for i, colName := range stmt.indexOn {
+		col, err := table.GetColumnByName(colName)
+		if err != nil {
+			return nil, err
+		}
+
+		cols[i] = col
+	}
+	return table.GetIndexByName(indexName(table.name, cols))
 }
 
 type UnionStmt struct {
@@ -2688,7 +2919,6 @@ func (stmt *UnionStmt) inferParameters(ctx context.Context, tx *SQLTx, params ma
 	if err != nil {
 		return err
 	}
-
 	return stmt.right.inferParameters(ctx, tx, params)
 }
 
@@ -2919,7 +3149,7 @@ type JoinSpec struct {
 }
 
 type OrdCol struct {
-	sel       *ColSelector
+	sel       Selector
 	descOrder bool
 }
 
@@ -2955,7 +3185,6 @@ func (sel *ColSelector) resolve(implicitTable string) (aggFn, table, col string)
 	if sel.table != "" {
 		table = sel.table
 	}
-
 	return "", table, sel.col
 }
 
@@ -3262,7 +3491,19 @@ func (bexp *NumExp) reduce(tx *SQLTx, row *Row, implicitTable string) (TypedValu
 		return nil, err
 	}
 
+	vl = unwrapJSON(vl)
+	vr = unwrapJSON(vr)
+
 	return applyNumOperator(bexp.op, vl, vr)
+}
+
+func unwrapJSON(v TypedValue) TypedValue {
+	if jsonVal, ok := v.(*JSON); ok {
+		if sv, isSimple := jsonVal.castToTypedValue(); isSimple {
+			return sv
+		}
+	}
+	return v
 }
 
 func (bexp *NumExp) reduceSelectors(row *Row, implicitTable string) ValueExp {
@@ -3417,12 +3658,13 @@ func (bexp *LikeBoolExp) reduce(tx *SQLTx, row *Row, implicitTable string) (Type
 		return nil, fmt.Errorf("error in 'LIKE' clause: %w", err)
 	}
 
-	if rval.Type() != VarcharType {
-		return nil, fmt.Errorf("error in 'LIKE' clause: %w (expecting %s)", ErrInvalidTypes, VarcharType)
-	}
-
 	if rval.IsNull() {
 		return &Bool{val: false}, nil
+	}
+
+	rvalStr, ok := rval.RawValue().(string)
+	if !ok {
+		return nil, fmt.Errorf("error in 'LIKE' clause: %w (expecting %s)", ErrInvalidTypes, VarcharType)
 	}
 
 	rpattern, err := bexp.pattern.reduce(tx, row, implicitTable)
@@ -3434,7 +3676,7 @@ func (bexp *LikeBoolExp) reduce(tx *SQLTx, row *Row, implicitTable string) (Type
 		return nil, fmt.Errorf("error evaluating 'LIKE' clause: %w", ErrInvalidTypes)
 	}
 
-	matched, err := regexp.MatchString(rpattern.RawValue().(string), rval.RawValue().(string))
+	matched, err := regexp.MatchString(rpattern.RawValue().(string), rvalStr)
 	if err != nil {
 		return nil, fmt.Errorf("error in 'LIKE' clause: %w", err)
 	}
@@ -3687,16 +3929,16 @@ func updateRangeFor(colID uint32, val TypedValue, cmp CmpOperator, rangesByColID
 }
 
 func cmpSatisfiesOp(cmp int, op CmpOperator) bool {
-	switch cmp {
-	case 0:
+	switch {
+	case cmp == 0:
 		{
 			return op == EQ || op == LE || op == GE
 		}
-	case -1:
+	case cmp < 0:
 		{
 			return op == NE || op == LT || op == LE
 		}
-	case 1:
+	case cmp > 0:
 		{
 			return op == NE || op == GT || op == GE
 		}
@@ -3775,14 +4017,18 @@ func (bexp *BinBoolExp) reduce(tx *SQLTx, row *Row, implicitTable string) (Typed
 		return nil, err
 	}
 
-	vr, err := bexp.right.reduce(tx, row, implicitTable)
-	if err != nil {
-		return nil, err
-	}
-
 	bl, isBool := vl.(*Bool)
 	if !isBool {
 		return nil, fmt.Errorf("%w (expecting boolean value)", ErrInvalidValue)
+	}
+
+	if (bexp.op == OR && bl.val) || (bexp.op == AND && !bl.val) {
+		return &Bool{val: bl.val}, nil
+	}
+
+	vr, err := bexp.right.reduce(tx, row, implicitTable)
+	if err != nil {
+		return nil, err
 	}
 
 	br, isBool := vr.(*Bool)
